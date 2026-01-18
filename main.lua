@@ -1,30 +1,25 @@
-function main(Data)
-   -- Parse the HL7 message
-   local msg, msgType = hl7.parse{vmd='simple.vmd', data=Data}
-   
-   -- Get facility from MSH-4
-   local facility = tostring(msg.MSH[4][1])
-   
-   -- Determine routing destination
-   local destination = route_message(facility)
-   
-   --  Apply PII masking if going to non-prod
-   local outputData = Data
-	if destination ~= 'PRODUCTION' then
-      if string.find(Data, "PID|") then
-         msg = mask_pii(msg)
-         outputData = msg:S()
-      else
-         iguana.logInfo("PII masking: Skipped")
-      end
+-- Direct MLLP send function
+local function send_mllp(host, port, message)
+   local success, err = pcall(function()
+      local tcp = net.tcp.connect{host=host, port=port, timeout=5}
+      local MLLP_START = string.char(0x0b)
+      local MLLP_END = string.char(0x1c, 0x0d)
+      tcp:send(MLLP_START .. message .. MLLP_END)
+      local response = tcp:recv()
+      tcp:close()
+      iguana.logInfo("Message sent successfully, ACK received")
+   end)
+   if not success then
+      iguana.logError("Send failed: " .. tostring(err))
    end
-   
-   -- Log the decision
-   iguana.logInfo("ROUTING: " .. (msgType or "UNKNOWN") .. " from [" .. facility .. "] --> " .. destination)
-   
-   -- Pass to next component
-   queue.push{data=outputData}
+   return success
 end
+
+local DEST_PORTS = {
+	PRODUCTION=5001,
+   ["NON-PRODUCTION"]=5002,
+   ["NON-PRODUCTION (default)"]=5002
+}
 
 local ROUTING_TABLE = {
    MAIN_HOSPITAL = "PRODUCTION",
@@ -90,4 +85,38 @@ function mask_pii(msg)
    end
       
    return msg
+end
+
+function main(Data)
+   -- Parse the HL7 message
+   local msg, msgType = hl7.parse{vmd='simple.vmd', data=Data}
+   
+   -- Get facility from MSH-4
+   local facility = tostring(msg.MSH[4][1])
+   
+   -- Determine routing destination
+   local destination = route_message(facility)
+   
+   -- Apply PII masking if going to non-prod
+   local outputData = Data
+   if destination ~= 'PRODUCTION' then
+      if string.find(Data, "PID|") then
+         msg = mask_pii(msg)
+         outputData = msg:S()
+         iguana.logInfo("PII masking: Applied")
+      else
+         iguana.logInfo("PII masking: Skipped (no PID segment)")
+      end
+   else
+      iguana.logInfo("PII masking: Skipped (production)")
+   end
+   
+   -- Log the routing decision
+   iguana.logInfo("ROUTING: " .. (msgType or "UNKNOWN") .. " from [" .. facility .. "] --> " .. destination)
+   
+   -- Get destination port and send directly
+   local port = DEST_PORTS[destination] or 5002
+   iguana.logInfo("Sending to 127.0.0.1:" .. port)
+   
+   send_mllp("127.0.0.1", port, outputData)
 end
