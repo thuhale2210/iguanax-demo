@@ -11,8 +11,12 @@ function main(Data)
    --  Apply PII masking if going to non-prod
    local outputData = Data
 	if destination ~= 'PRODUCTION' then
-      msg = mask_pii(msg)
-      outputData = msg:S()
+      if string.find(Data, "PID|") then
+         msg = mask_pii(msg)
+         outputData = msg:S()
+      else
+         iguana.logInfo("PII masking: Skipped")
+      end
    end
    
    -- Log the decision
@@ -45,7 +49,6 @@ end
 
 function mask_pii(msg)
    if not msg.PID then
-      iguana.logInfo("PII Masking: No PID segment, skipping.")
       return msg
    end
    
