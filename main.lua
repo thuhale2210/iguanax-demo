@@ -1,48 +1,26 @@
--- Direct MLLP send function
-local function send_mllp(host, port, message)
-   local success, err = pcall(function()
-      local tcp = net.tcp.connect{host=host, port=port, timeout=5}
-      local MLLP_START = string.char(0x0b)
-      local MLLP_END = string.char(0x1c, 0x0d)
-      tcp:send(MLLP_START .. message .. MLLP_END)
-      local response = tcp:recv()
-      tcp:close()
-      iguana.logInfo("Message sent successfully, ACK received")
-   end)
-   if not success then
-      iguana.logError("Send failed: " .. tostring(err))
-   end
-   return success
-end
-
-local DEST_PORTS = {
-	PRODUCTION=5001,
-   ["NON-PRODUCTION"]=5002,
-   ["NON-PRODUCTION (default)"]=5002
-}
-
 local ROUTING_TABLE = {
-   MAIN_HOSPITAL = "PRODUCTION",
-   LAB           = "PRODUCTION",
-   RADIOLOGY     = "PRODUCTION",
-   PHARMACY      = "PRODUCTION",
-   EMERGENCY     = "PRODUCTION",
-   CLINIC        = "PRODUCTION",
-   ICU           = "PRODUCTION",
-   SURGERY       = "PRODUCTION",
-   TEST_CLINIC   = "NON-PRODUCTION",
-   DEV_SYSTEM    = "NON-PRODUCTION",
-   UAT_ENV       = "NON-PRODUCTION",
-   TRAINING_LAB  = "NON-PRODUCTION",
-   SANDBOX       = "NON-PRODUCTION"
+   MAIN_HOSPITAL = "PROD",
+   LAB           = "PROD",
+   RADIOLOGY     = "PROD",
+   PHARMACY      = "PROD",
+   EMERGENCY     = "PROD",
+   CLINIC        = "PROD",
+   ICU           = "PROD",
+   SURGERY       = "PROD",
+
+   TEST_CLINIC   = "NONPROD",
+   DEV_SYSTEM    = "NONPROD",
+   UAT_ENV       = "NONPROD",
+   TRAINING_LAB  = "NONPROD",
+   SANDBOX       = "NONPROD"
 }
 
-function route_message(facility)
-   local f = string.upper(facility)
-   return ROUTING_TABLE[f] or "NON-PRODUCTION (default)"
+function RouteFacility(Facility)
+   local f = string.upper(Facility or "")
+   return ROUTING_TABLE[f] or "NONPROD"
 end
 
-function mask_pii(msg)
+function PIImask(msg)
    if not msg.PID then
       return msg
    end
@@ -87,36 +65,106 @@ function mask_pii(msg)
    return msg
 end
 
-function main(Data)
-   -- Parse the HL7 message
-   local msg, msgType = hl7.parse{vmd='simple.vmd', data=Data}
-   
-   -- Get facility from MSH-4
-   local facility = tostring(msg.MSH[4][1])
-   
-   -- Determine routing destination
-   local destination = route_message(facility)
-   
-   -- Apply PII masking if going to non-prod
-   local outputData = Data
-   if destination ~= 'PRODUCTION' then
-      if string.find(Data, "PID|") then
-         msg = mask_pii(msg)
-         outputData = msg:S()
-         iguana.logInfo("PII masking: Applied")
-      else
-         iguana.logInfo("PII masking: Skipped (no PID segment)")
-      end
-   else
-      iguana.logInfo("PII masking: Skipped (production)")
+function VALbasicChecks(Data)
+   if type(Data) ~= 'string' or #Data < 8 then
+      return false, "Message is empty/too short"
    end
-   
-   -- Log the routing decision
-   iguana.logInfo("ROUTING: " .. (msgType or "UNKNOWN") .. " from [" .. facility .. "] --> " .. destination)
-   
-   -- Get destination port and send directly
-   local port = DEST_PORTS[destination] or 5002
-   iguana.logInfo("Sending to 127.0.0.1:" .. port)
-   
-   send_mllp("127.0.0.1", port, outputData)
+
+   if Data:sub(1,3) ~= "MSH" then
+      return false, "Message does not start with MSH"
+   end
+
+   local fs = Data:sub(4,4)
+   if fs == "\r" or fs == "\n" or fs == "" then
+      return false, "Invalid field separator in MSH-1"
+   end
+
+   if not Data:find("\r", 1, true) then
+      return false, "No segment delimiters (CR). Not a valid HL7 payload"
+   end
+
+   -- cheap parse of MSH line for required fields
+   local eol = Data:find("\r", 1, true)
+   local msh = Data:sub(1, eol-1)
+   local f = msh:split(fs)
+
+   -- MSH|... => f[1]="MSH", f[2]=encoding, f[9]=MSH-9, f[10]=MSH-10
+   local msgType = f[9] or ""
+   local ctrlId  = f[10] or ""
+
+   if msgType == "" then
+      return false, "Missing MSH-9 (message type)"
+   end
+   if ctrlId == "" then
+      return false, "Missing MSH-10 (control ID)"
+   end
+
+   return true, "OK"
+end
+
+function ERRformat(Reason, Data)
+   -- Keep it readable in the file
+   local preview = Data or ""
+   if #preview > 2000 then
+      preview = preview:sub(1,2000) .. "\n...[truncated]..."
+   end
+
+   local out = {}
+   out[#out+1] = "HL7 ROUTER ERROR:"
+   out[#out+1] = "Time: " .. os.date("!%Y-%m-%dT%H:%M:%SZ")
+   out[#out+1] = "Reason: " .. tostring(Reason)
+   out[#out+1] = "---- Original Message ----"
+   out[#out+1] = preview
+   out[#out+1] = ""
+   return table.concat(out, "\n")
+end
+
+function main(Data)
+   local comps = iguana.components()
+   local prodId    = comps["Test Listener (Prod)"]
+   local nonProdId = comps["Test Listener (Nonprod)"]
+   local errId     = comps["Error Logger (To File)"]
+
+   if not prodId or not nonProdId or not errId then
+      error("Missing component IDs. Check names in iguana.components().")
+   end
+
+   -- 1) Validate basics (fast, catches garbage)
+   local ok, reason = VALbasicChecks(Data)
+   if not ok then
+      iguana.logWarning("INVALID HL7 (basic): " .. reason)
+      message.send{data=ERRformat(reason, Data), id=errId}
+      return
+   end
+
+   -- 2) Parse (catches deeper structural issues)
+   local msg
+   local okParse, errParse = pcall(function()
+      msg = hl7.parse{vmd='simple.vmd', data=Data}
+   end)
+
+   if not okParse or not msg then
+      local r = "HL7 parse failed: " .. tostring(errParse)
+      iguana.logWarning(r)
+      message.send{data=ERRformat(r, Data), id=errId}
+      return
+   end
+
+   -- 3) Route
+   local facility = tostring(msg.MSH[4][1] or "")
+   local route = RouteFacility(facility)
+
+   local out = Data
+   if route == "NONPROD" and Data:find("PID|", 1, true) then
+      msg = PIImask(msg)
+      out = msg:S()
+   end
+
+   iguana.logInfo("ROUTER: FACILITY="..facility.." ROUTE="..route)
+
+   if route == "PROD" then
+      message.send{data=out, id=prodId}
+   else
+      message.send{data=out, id=nonProdId}
+   end
 end
