@@ -1,18 +1,18 @@
 local ROUTING_TABLE = {
    MAIN_HOSPITAL = "PROD",
-   LAB           = "PROD",
-   RADIOLOGY     = "PROD",
-   PHARMACY      = "PROD",
-   EMERGENCY     = "PROD",
-   CLINIC        = "PROD",
-   ICU           = "PROD",
-   SURGERY       = "PROD",
+   LAB = "PROD",
+   RADIOLOGY = "PROD",
+   PHARMACY = "PROD",
+   EMERGENCY = "PROD",
+   CLINIC = "PROD",
+   ICU = "PROD",
+   SURGERY = "PROD",
 
-   TEST_CLINIC   = "NONPROD",
-   DEV_SYSTEM    = "NONPROD",
-   UAT_ENV       = "NONPROD",
-   TRAINING_LAB  = "NONPROD",
-   SANDBOX       = "NONPROD"
+   TEST_CLINIC = "NONPROD",
+   DEV_SYSTEM = "NONPROD",
+   UAT_ENV = "NONPROD",
+   TRAINING_LAB = "NONPROD",
+   SANDBOX = "NONPROD"
 }
 
 function RouteFacility(Facility)
@@ -65,7 +65,7 @@ function PIImask(msg)
    return msg
 end
 
-function VALbasicChecks(Data)
+function validBasicChecks(Data)
    if type(Data) ~= 'string' or #Data < 8 then
       return false, "Message is empty/too short"
    end
@@ -103,7 +103,6 @@ function VALbasicChecks(Data)
 end
 
 function ERRformat(Reason, Data)
-   -- Keep it readable in the file
    local preview = Data or ""
    if #preview > 2000 then
       preview = preview:sub(1,2000) .. "\n...[truncated]..."
@@ -121,16 +120,16 @@ end
 
 function main(Data)
    local comps = iguana.components()
-   local prodId    = comps["Test Listener (Prod)"]
+   local prodId = comps["Test Listener (Prod)"]
    local nonProdId = comps["Test Listener (Nonprod)"]
-   local errId     = comps["Error Logger (To File)"]
+   local errId = comps["Error Logger (To File)"]
 
    if not prodId or not nonProdId or not errId then
       error("Missing component IDs. Check names in iguana.components().")
    end
 
-   -- 1) Validate basics (fast, catches garbage)
-   local ok, reason = VALbasicChecks(Data)
+   -- 1) Validate basics
+   local ok, reason = validBasicChecks(Data)
    if not ok then
       iguana.logWarning("INVALID HL7 (basic): " .. reason)
       message.send{data=ERRformat(reason, Data), id=errId}
